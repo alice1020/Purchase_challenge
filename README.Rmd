@@ -1,0 +1,249 @@
+---
+title: "Predicting Purchases"
+author: "Alice Milivinti"
+date: "March 8, 2019"
+output: rmarkdown::github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+
+library("BoomSpikeSlab")
+library('data.table')
+library('ggplot2')
+library("tidyr")
+library("dplyr")
+options(scipen = 100, digits = 4)
+
+
+```
+
+
+## Data Import
+
+Import data and check the format.
+
+```{r data}
+
+training <- read.table(file = '/home/alice/Downloads/6sense Task/takehome/training.tsv', sep = '\t', header = FALSE)
+test <- read.table(file = '/home/alice/Downloads/6sense Task/takehome/test.tsv', sep = '\t', header = FALSE)
+
+# Check data loading
+head(training)
+#head(test)
+
+```
+
+## Data Maganement
+
+Rename columns and define the time column as date format.
+
+
+```{r data management1}
+
+# rename columns
+train_data <-  sample_frac(training, 0.1) %>% # Extract random 10% sample of training data
+  rename(id = V1, time = V2, state = V3) %>%
+  mutate(time = as.Date(time))
+
+#-------------------------------------------------------------------------------
+
+
+test_data <- test %>%
+  rename(id = V1, time = V2, state = V3) %>%
+  mutate(time = as.Date(time))
+
+
+```
+
+Brief summary statistics. Test data does not include CustomerSupport.
+
+```{r summary stat}
+summary(train_data$time)
+table(train_data$state)
+
+table(test_data$state)
+
+```
+
+Check for non-unique id-time. Data include 27,662 contemporary actions.
+
+```{r unique}
+doubles <- train_data %>%
+  group_by(id, time) %>%  # Check for non-unique id-time 
+  filter( n() > 1 ) 
+nrow(doubles)
+
+```
+
+Reshape the data to a wide (dummy variables) structure to have unique id-time & harmonize the chronological sequence (new variable fict_time) to have all the ids on a common scale.
+
+```{r reshape}
+train_data1 <- train_data %>%
+  group_by(id, time) %>%
+  unnest(state) %>% 
+  mutate(status = 1, fict_time = 1) %>% 
+  spread(state, status, fill = 0)  %>% # from categorical variables to dummies
+  arrange(id, time) %>%  # Re-scale the time to have all the ids on a single scale
+  group_by(id) %>%
+  mutate(fict_time = cumsum(fict_time)) # generate the harmonized time
+
+#-------------------------------------------------------------------------------
+
+
+test_data1 <- test_data %>%
+  group_by(id, time) %>%
+  unnest(state) %>% 
+  mutate(status = 1, fict_time = 1) %>% 
+  spread(state, status, fill = 0)  %>% # from categorical variables to dummies
+  arrange(id, time) %>%  # Re-scale the time to have all the ids on a single scale
+  group_by(id) %>%
+  mutate(fict_time = cumsum(fict_time))
+
+head(train_data1)
+
+```
+
+Add new variables for the lagged dummy variables (lag = t-1) as well as the sequence of actions each ids does before a purchase. The latter is achieved by nesting by ids and Purchase and doing the cumulative sums of the dummy variables. 
+
+```{r new variables}
+
+train_data1 <- train_data1 %>%
+  group_by(id) %>%
+  mutate(
+        # lags
+         Purchase_lag1 = lag(Purchase, 1, order_by = fict_time), 
+         EmailClickthrough_lag1 = lag(EmailClickthrough, 1, order_by = fict_time),
+         EmailOpen_lag1 = lag(EmailOpen, 1, order_by = fict_time),
+         FormSubmit_lag1 = lag(FormSubmit, 1, order_by = fict_time),
+         PageView_lag1 = lag(PageView, 1, order_by = fict_time),
+         WebVisit_lag1 = lag(WebVisit, 1, order_by = fict_time),
+         # cumsums Purchase
+         Purchase_cumsum = cumsum(Purchase)) %>% 
+  # nest by
+  group_by(id, Purchase_cumsum) %>%
+  
+  mutate(
+         # cumsums -> # number of occurrances before purcase
+         EmailOpen_cumsum = cumsum(EmailOpen), 
+         EmailClickthrough_cumsum = cumsum(EmailClickthrough),
+         FormSubmit_cumsum = cumsum(FormSubmit),
+         PageView_cumsum = cumsum(PageView),
+         WebVisit_cumsum = cumsum(WebVisit))
+
+
+#-------------------------------------------------------------------------------
+
+
+test_data1 <- test_data1 %>%
+  group_by(id) %>%
+  mutate(EmailClickthrough_lag1 = lag(EmailClickthrough, 1, order_by = fict_time),
+         EmailOpen_lag1 = lag(EmailOpen, 1, order_by = fict_time),
+         FormSubmit_lag1 = lag(FormSubmit, 1, order_by = fict_time),
+         PageView_lag1 = lag(PageView, 1, order_by = fict_time),
+         WebVisit_lag1 = lag(WebVisit, 1, order_by = fict_time)) %>%
+  group_by(id) %>%
+  mutate(EmailOpen_cumsum = cumsum(EmailOpen), 
+         EmailClickthrough_cumsum = cumsum(EmailClickthrough),
+         FormSubmit_cumsum = cumsum(FormSubmit),
+         PageView_cumsum = cumsum(PageView),
+         WebVisit_cumsum = cumsum(WebVisit))
+
+head(train_data1)
+
+```
+
+## Bayeasian Regression Analysis 
+
+# Fitting Stage
+I use Bayesian logistic regressions fitted under a spike-and-slab prior with the prior inclusion probability of each predictor set.
+
+The plot hereafter depicts the most useful activities in predicting which user will purchase in the future.
+
+
+```{r bayesian reg 1, warnings = FALSE, message = FALSE}
+# Bayesian Logistic 
+logit_b <- logit.spike(Purchase ~ EmailClickthrough + EmailOpen + FormSubmit + PageView + WebVisit + fict_time +
+                 EmailClickthrough_lag1 + EmailOpen_lag1 + FormSubmit_lag1 + PageView_lag1 + WebVisit_lag1 +
+                 EmailOpen_cumsum + EmailClickthrough_cumsum + FormSubmit_cumsum + PageView_cumsum + WebVisit_cumsum, 
+                 data = train_data1, niter = 500, seed = 1234)
+
+# check for the significant coefficients to incude
+# shaded by the conditional probability that a coefficient is positive, given that it is nonzero.
+plot(logit_b)
+
+summary(logit_b)
+
+```
+
+
+## Results Fitting Stage
+
+I visually assess the results of the logit model. The model fails when it predicts either a false negative or false positive outcome.
+I set a sensitivity threshold of 65% after a first graphical inspection. 
+
+```{r results bayesian} 
+
+train_data_m <- as.data.table(train_data1)
+
+fit_prob_b <- as.data.table(logit_b$fitted.probabilities) %>%
+  rename(pred = V1) %>%
+  cbind(., train_data_m[!is.na(train_data_m$PageView_lag1)])
+
+
+# ggplot function
+plot_pred_type_distribution <- function(df, threshold) {
+  v <- rep(NA, nrow(df))
+  v <- ifelse(df$pred >= threshold & df$Purchase == 1, "True-Pos", v)
+  v <- ifelse(df$pred >= threshold & df$Purchase == 0, "False-Pos", v)
+  v <- ifelse(df$pred < threshold & df$Purchase == 1, "False-Neg", v)
+  v <- ifelse(df$pred < threshold & df$Purchase == 0, "True-Neg", v)
+  
+  df$pred_type <- v
+  
+  ggplot(data=df, aes(x=Purchase, y=pred)) + 
+    geom_violin(fill=rgb(1,1,1,alpha=0.6), color=NA) + 
+    geom_jitter(aes(color=pred_type), alpha=0.6) +
+    geom_hline(yintercept=threshold, color="red", alpha=0.6) +
+    scale_color_discrete(name = "type") +
+    labs(title=sprintf("Threshold at %.2f", threshold))
+}
+
+plot_pred_type_distribution(fit_prob_b, 0.65)
+
+# Probability False Positive
+(nrow(fit_prob_b[fit_prob_b$pred >= 0.65 & fit_prob_b$Purchase == 0,]) / nrow(fit_prob_b[fit_prob_b$Purchase == 0,])) * 100
+# Ptobability False Negative
+(nrow(fit_prob_b[fit_prob_b$pred < 0.65 & fit_prob_b$Purchase == 1,]) / nrow(fit_prob_b[fit_prob_b$Purchase == 1,])) * 100
+
+
+```
+
+## Predictions
+
+I use the model fitted on the training set to predict the test set.
+
+```{r predictions, warning=FALSE}
+
+pred_b <- predict(logit_b, newdata = test_data1)
+
+test_data1 <- as.data.table(test_data1)
+
+pred_mean <- as.data.table(rowMeans(pred_b)) %>%
+  cbind(., test_data1[, c('id')]) %>%
+  group_by(id) %>%
+  summarise(tot_prob = sum(V1, na.rm = TRUE)) %>%
+  arrange(desc(tot_prob)) 
+
+# extract the 1000 user_id's most likely to purchase.
+
+write.csv(pred_mean[1:1000, 1], "/home/alice/Downloads/6sense Task/1000_users1.csv", sep = ',')
+
+
+```
+
+
+
+
+
+
